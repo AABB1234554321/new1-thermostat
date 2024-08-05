@@ -1,151 +1,300 @@
 import streamlit as st
+import matplotlib.pyplot as plt
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# --- App Title and Description ---
+st.title("Thermostat Simulation: Comparing Control Algorithms")
+st.write("This interactive simulation compares On-Off, PID, and Q-Learning control algorithms for maintaining room temperature.")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# --- File Uploader ---
+uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)  # Veri setinizi yükleyin
+    outdoor_temp_values = df['Outdoor Temp (C)'].values
+else:
+    st.error("Please upload a CSV file to proceed.")
+    st.stop()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# --- Input Parameters ---
+st.sidebar.header("Simulation Parameters")
+initial_room_temperature = st.sidebar.number_input("Initial Room Temperature (°C)", min_value=10, max_value=30, value=19)
+thermostat_setting = st.sidebar.number_input("Thermostat Setting (°C)", min_value=15, max_value=25, value=20)
+heater_power = st.sidebar.slider("Heater Power (°C/minute)", min_value=0.1, max_value=0.5, value=0.3)
+base_heat_loss = st.sidebar.slider("Base Heat Loss (°C/minute)", min_value=0.05, max_value=0.2, value=0.1)
+simulation_minutes = st.sidebar.number_input("Simulation Minutes", min_value=10, max_value=5000, value=60)
+thermostat_sensitivity = st.sidebar.slider("Thermostat Sensitivity (°C)", min_value=0.1, max_value=0.5, value=0.5, step=0.1)
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# --- Q-Learning Parameters ---
+st.sidebar.subheader("Q-Learning Parameters")
+episodes = st.sidebar.number_input("Training Episodes", min_value=100, max_value=5000, value=1000)
+learning_rate = 0.1  # Fixed for simplicity
+discount_factor = 0.95  # Fixed for simplicity
+exploration_rate = 0.1  # Fixed for simplicity
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# --- PID Parameters ---
+st.sidebar.subheader("PID Parameters")
+Kp = st.sidebar.slider("Kp (Proportional Gain)", min_value=0.1, max_value=7.00, value=7.00)
+Ki = st.sidebar.slider("Ki (Integral Gain)", min_value=0.01, max_value=0.7, value=0.05)
+Kd = st.sidebar.slider("Kd (Derivative Gain)", min_value=0.001, max_value=0.2, value=0.01)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# --- Global Variables ---
+num_states = 41
+num_actions = 2
+q_table = np.zeros((num_states, num_actions))  # Initialize q_table here
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+# --- Helper Functions ---
+def get_state(temperature):
+    """Discretizes the temperature into states."""
+    return int(min(40, max(0, (temperature - 10) / 0.5)))
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def get_action(state, q_table, exploration_rate):
+    """Chooses an action based on the epsilon-greedy policy."""
+    if np.random.uniform(0, 1) < exploration_rate:
+        return np.random.choice(num_actions)  # Exploration
+    else:
+        return np.argmax(q_table[state, :])  # Exploitation
 
-    return gdp_df
+def get_reward(state, action, thermostat_setting):
+    """Calculates the reward based on the state and action."""
+    state_temp = 10 + state * 0.5
+    if abs(state_temp - thermostat_setting) <= 0.5:
+        return 10  # Within acceptable range
+    elif action == 1 and state_temp > thermostat_setting + 0.5:  # Too hot
+        return -10
+    elif action == 0 and state_temp < thermostat_setting - 0.5:  # Too cold
+        return -5
+    else:
+        return -1  # Slight penalty for not being in range
 
-gdp_df = get_gdp_data()
+def get_outdoor_temp(minute, outdoor_temp_values):
+    """Gets the outdoor temperature for the current minute."""
+    index = int(minute // 5)  # Her 5 dakikada bir güncelle
+    return outdoor_temp_values[min(index, len(outdoor_temp_values) - 1)]
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+# --- Simulation Logic (On-Off) ---
+def run_on_off_simulation(initial_room_temperature, thermostat_sensitivity):
+    time = []
+    room_temperatures = []
+    room_temperature = initial_room_temperature
+    heater_status = False
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    for minute in np.arange(0, simulation_minutes, 0.1):
+        time.append(minute)
+        outside_temperature = get_outdoor_temp(minute, outdoor_temp_values)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        if room_temperature < thermostat_setting - thermostat_sensitivity:
+            heater_status = True
+        elif room_temperature > thermostat_setting + thermostat_sensitivity:
+            heater_status = False
 
-# Add some spacing
-''
-''
+        heat_loss = base_heat_loss * (room_temperature - outside_temperature) / 10
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[gdp_df['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[gdp_df['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+        if heater_status:
+            room_temperature += heater_power * 0.1
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            room_temperature -= heat_loss * 0.1
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+        room_temperatures.append(room_temperature)
+
+    area_on_off = calculate_area_between_temp(time, room_temperatures, thermostat_setting)
+    return time, room_temperatures, area_on_off  # Return area_on_off
+
+# --- Simulation Logic (Q-Learning) ---
+def run_q_learning_simulation(initial_room_temperature, thermostat_sensitivity):
+    global q_table  # Ensure we're using the global q_table
+    for episode in range(episodes):
+        room_temperature = initial_room_temperature
+        state = get_state(room_temperature)
+        for minute in np.arange(0, simulation_minutes, 0.1):
+            outside_temperature = get_outdoor_temp(minute, outdoor_temp_values)  # Add this line to get outdoor temperature
+            action = get_action(state, q_table, exploration_rate)
+            if action == 1:
+                room_temperature += heater_power * 0.1
+            else:
+                heat_loss = base_heat_loss * (room_temperature - outside_temperature) / 10
+                room_temperature -= heat_loss * 0.1
+
+            next_state = get_state(room_temperature)
+            reward = get_reward(next_state, action, thermostat_setting)
+
+            q_table[state, action] += learning_rate * (reward + discount_factor * np.max(q_table[next_state, :]) - q_table[state, action])
+            state = next_state
+
+    # Run one final simulation using the learned Q-table
+    time = []
+    room_temperatures = []
+
+    room_temperature = initial_room_temperature
+    state = get_state(room_temperature)
+    for minute in np.arange(0, simulation_minutes, 0.1):
+        outside_temperature = get_outdoor_temp(minute, outdoor_temp_values)  # Add this line to get outdoor temperature
+        action = np.argmax(q_table[state, :])  # Always choose the best action
+
+        if action == 1:
+            room_temperature += heater_power * 0.1
+        else:
+            heat_loss = base_heat_loss * (room_temperature - outside_temperature) / 10
+            room_temperature -= heat_loss * 0.1
+
+        state = get_state(room_temperature)
+        time.append(minute)
+        room_temperatures.append(room_temperature)
+
+    area_q = calculate_area_between_temp(time, room_temperatures, thermostat_setting)
+    return time, room_temperatures, area_q  # Return area_q
+
+# --- Simulation Logic (PID) ---
+def run_pid_simulation(initial_room_temperature, thermostat_sensitivity):
+    time = []
+    room_temperatures = []
+    heater_output = []
+
+    integral_error = 0
+    previous_error = 0
+    room_temperature = initial_room_temperature
+
+    for minute in np.arange(0, simulation_minutes, 0.1):
+        time.append(minute)
+        outside_temperature = get_outdoor_temp(minute, outdoor_temp_values)
+
+        error = thermostat_setting - room_temperature
+        proportional_term = Kp * error
+        integral_error += error * 0.1
+        integral_term = Ki * integral_error
+        derivative_term = Kd * (error - previous_error) / 0.1
+        previous_error = error
+
+        pid_output = proportional_term + integral_term + derivative_term
+        pid_output = max(0, min(pid_output, 1))  # PID çıkışını sınırla
+        heater_output.append(pid_output)
+
+        heat_loss = base_heat_loss * (room_temperature - outside_temperature) / 10
+
+        room_temperature += (heater_power * pid_output - heat_loss) * 0.1
+        room_temperatures.append(room_temperature)
+
+    area_pid = calculate_area_between_temp(time, room_temperatures, thermostat_setting)
+    return time, room_temperatures, area_pid  # Return area_pid
+
+# --- Calculate Area Between Current Temperature and Set Temperature ---
+def calculate_area_between_temp(time, room_temperatures, set_temp):
+    area = 0
+    for i in range(1, len(time)):
+        dt = time[i] - time[i - 1]
+        avg_temp = (room_temperatures[i] + room_temperatures[i - 1]) / 2
+        area += abs(avg_temp - set_temp) * dt
+    return area
+def calculate_area_metrics(time, room_temperatures, set_temp):
+    overshoot = 0
+    undershoot = 0
+    for i in range(1, len(time)):
+        dt = time[i] - time[i - 1]
+        avg_temp = (room_temperatures[i] + room_temperatures[i - 1]) / 2
+        if avg_temp > set_temp:
+            overshoot += (avg_temp - set_temp) * dt
+        elif avg_temp < set_temp:
+            undershoot += (set_temp - avg_temp) * dt
+    return overshoot, undershoot
+# --- Main Execution ---
+st.title("Thermostat Control Simulation")
+
+# Algorithm Selection
+simulation_type = st.sidebar.multiselect("Choose Simulation Type(s):", ["On-Off", "Q-Learning", "PID"])
+
+
+# Run Simulations
+if st.button("Run Simulations"):
+    # Initialize variables
+    results = {}
+    overshoots = {}
+    undershoots = {}
+
+    if "On-Off" in simulation_type:
+        time_on_off, room_temperatures_on_off, area_on_off = run_on_off_simulation(initial_room_temperature, thermostat_sensitivity)
+        overshoot_on_off, undershoot_on_off = calculate_area_metrics(time_on_off, room_temperatures_on_off, thermostat_setting)
+        results["On-Off"] = {'time': time_on_off, 'room_temperatures': room_temperatures_on_off}
+        overshoots["On-Off"] = overshoot_on_off
+        undershoots["On-Off"] = undershoot_on_off
+
+    if "Q-Learning" in simulation_type:
+        time_q, room_temperatures_q, area_q = run_q_learning_simulation(initial_room_temperature, thermostat_sensitivity)
+        overshoot_q, undershoot_q = calculate_area_metrics(time_q, room_temperatures_q, thermostat_setting)
+        results["Q-Learning"] = {'time': time_q, 'room_temperatures': room_temperatures_q}
+        overshoots["Q-Learning"] = overshoot_q
+        undershoots["Q-Learning"] = undershoot_q
+
+    if "PID" in simulation_type:
+        time_pid, room_temperatures_pid, area_pid = run_pid_simulation(initial_room_temperature, thermostat_sensitivity)
+        overshoot_pid, undershoot_pid = calculate_area_metrics(time_pid, room_temperatures_pid, thermostat_setting)
+        results["PID"] = {'time': time_pid, 'room_temperatures': room_temperatures_pid}
+        overshoots["PID"] = overshoot_pid
+        undershoots["PID"] = undershoot_pid
+
+
+    fig1, ax1 = plt.subplots(figsize=(30, 15))
+    for algo, data in results.items():
+        ax1.plot(data['time'], data['room_temperatures'], label=f"Room Temperature ({algo})")
+
+    ax1.axhline(y=thermostat_setting, color='r', linestyle='--', label="Thermostat Setting")
+    ax1.set_xlabel("Time (Minutes)")
+    ax1.set_ylabel("Temperature (°C)")
+    ax1.legend()
+    ax1.grid(True)
+    ax1.set_title("Room Temperature Control Simulation")
+
+    st.pyplot(fig1)
+
+    # Bar Chart for Comfort and Energy Metrics
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    labels = list(overshoots.keys())
+    overshoot_values = [overshoots[algo] for algo in labels]
+    undershoot_values = [undershoots[algo] for algo in labels]
+
+    width = 0.2
+    x = np.arange(len(labels))
+
+    ax2.bar(x - width, overshoot_values, width, label='Overshoot', color='skyblue')
+    ax2.bar(x, undershoot_values, width, label='Undershoot', color='lightcoral')
+
+    ax2.set_ylabel('Area (°C*minutes)')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels)
+    ax2.legend(loc='upper right')
+    ax2.set_title("Comfort and Energy Consumption Metrics")
+
+    # Display Comfort and Energy Metrics
+    st.write("### Comfort and Energy Metrics")
+    st.write(f"**Overshoot and Undershoot Values:**")
+    for algo in labels:
+        st.write(f"{algo} - Overshoot: {overshoot_values[labels.index(algo)]:.2f} °C*minutes, Undershoot: {undershoot_values[labels.index(algo)]:.2f} °C*minutes")
+
+    st.pyplot(fig2)
+
+    # Comparison of Total Overshoot and Undershoot
+    fig3, ax3 = plt.subplots(figsize=(10, 6))
+    total_overshoot_undershoot = {algo: overshoots[algo] + undershoots[algo] for algo in labels}
+
+    ax3.bar(total_overshoot_undershoot.keys(), total_overshoot_undershoot.values(), color=['blue', 'green', 'orange'])
+    ax3.set_title('Total Overshoot and Undershoot Comparison')
+    ax3.set_ylabel('Total Area (°C*minutes)')
+        # Display Total Overshoot and Undershoot Comparison
+    st.write("### Total Overshoot and Undershoot Comparison")
+    st.write(f"**Total Area Values:**")
+    for algo, total_value in total_overshoot_undershoot.items():
+        st.write(f"{algo} - Total Area: {total_value:.2f} °C*minutes")
+
+    st.pyplot(fig3)
+    
+    st.write("### Outdoor Temperature Plot")
+    # Outdoor Temperature Plot
+    outdoor_time = np.arange(0, simulation_minutes, 5)
+    outdoor_temps = [get_outdoor_temp(minute, outdoor_temp_values) for minute in outdoor_time]
+    fig4, ax4 = plt.subplots(figsize=(12, 6))
+    ax4.plot(outdoor_time, outdoor_temps, label="Outdoor Temperature", color='purple')
+    ax4.set_xlabel("Time (minutes)")
+    ax4.set_ylabel("Outdoor Temperature (°C)")
+    ax4.legend()
+    st.pyplot(fig4)
+
+ 
